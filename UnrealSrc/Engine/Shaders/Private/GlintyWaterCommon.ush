@@ -1,0 +1,160 @@
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "ShadingCommon.ush"
+#include "Strata/Glint/GlintThirdParty.ush"
+
+#pragma once
+
+#if MATERIAL_SHADINGMODEL_GLINTYWATER
+
+//=============================================================================
+//======== Tangent space maths ================================================
+//=============================================================================
+float get_cos_theta(const float3 w)       {return w.z;}
+float get_cos_2_theta(const float3 w)     {return w.z*w.z;}
+float get_sin_2_theta(const float3 w)     {return max(0.f, 1.f - get_cos_2_theta(w));}
+float get_sin_theta(const float3 w)       {return sqrt(get_sin_2_theta(w));}
+float get_tan_theta(const float3 w)       {return get_sin_theta(w) / get_cos_theta(w);}
+float get_cos_phi(const float3 w)         {return (get_sin_theta(w) == 0.f) ? 1.f : clamp(w.x / get_sin_theta(w), -1.f, 1.f);}
+float get_sin_phi(const float3 w)         {return (get_sin_theta(w) == 0.f) ? 0.f : clamp(w.y / get_sin_theta(w), -1.f, 1.f);}
+float get_cos_2_phi(const float3 w)       {return get_cos_phi(w) * get_cos_phi(w);}
+float get_sin_2_phi(const float3 w)       {return get_sin_phi(w) * get_sin_phi(w);} 
+
+//=============================================================================
+//======== Shifting view/incident direction for off-center V-cavity ===========
+//=============================================================================
+float3 shift_W(float3 w, // vector to be transformed
+             float x0, float y0 // average slope
+             )
+{
+    float3 shifted_w = float3(0., 0., 0.);
+
+    float cos_phi = get_cos_phi(w);
+    float sin_phi = get_sin_phi(w);
+    float tan_theta = get_tan_theta(w);
+
+    float2 w_xy = normalize(float2(cos_phi, sin_phi)); // vector projected in tangent space XY
+    float mu_phi = w_xy.x * x0 + w_xy.y * y0;
+
+    float cos_mu_phi = cos(mu_phi);
+    float sin_mu_phi = sin(mu_phi);
+
+    float w_z = 1. / tan_theta;
+
+    shifted_w.xy = w_xy;
+
+    float w_xy_length = length(w_xy);
+
+    float shifted_w_z = 0.;
+    if (cos_mu_phi < 0.) {
+        shifted_w_z = w_xy_length * (w_xy_length * cos_mu_phi - w_z * sin_mu_phi) / (w_z * cos_mu_phi + w_xy_length * sin_mu_phi);
+    }
+    else
+    {
+        shifted_w_z = w_xy_length * (w_z * cos_mu_phi + w_xy_length * sin_mu_phi) / (w_xy_length * cos_mu_phi - w_z * sin_mu_phi);
+    }
+
+    return normalize(float3(w_xy, shifted_w_z));
+}
+
+void AccumulateGlintyWaterModel(inout float3 DualBlendSurfaceLuminancePostCoverage,
+								inout float3 DualBlendSurfaceTransmittancePreCoverage,
+								inout float DualBlendSurfaceCoverage,
+								FMaterialPixelParameters MaterialParams,
+								FGBufferData GBuffer,
+								float3 DiffuseColor,
+								float3 SpecularColor,
+								float3 EmissiveColor,
+								float TopMaterialCoverage)
+{
+	const float3 N = MaterialParams.WorldNormal;
+	const float3 V = MaterialParams.CameraVector;
+    const float3 L = GetGlintyWaterParams4(MaterialParams).xyz;
+
+	const float NoV = saturate( abs( dot(N, V) ) + 1e-5 );
+
+	// how much to multiply the background color by
+	float3 Transmittance = float3(1.0,1.0,1.0);
+
+	// how much to add for foreground color
+	float3 SurfaceColor = float3(0.0f,0.0f,0.0f);
+
+	float2 GlintUV = GetGlintyWaterParams0(MaterialParams);
+
+    float2 Normals1 = GetGlintyWaterParams1(MaterialParams).xy;
+    float3 Normals2 = GetGlintyWaterParams2(MaterialParams).xyz;
+    
+    SurfaceColor = DiffuseColor + EmissiveColor;
+    
+    float3 SigmasRho = GetGlintyWaterParams3(MaterialParams);
+    float sigma_x_mat = SigmasRho.x;
+    float sigma_y_mat = SigmasRho.y;
+    float rho_mat = SigmasRho.z;
+    float density = GetGlintyWaterParams5(MaterialParams);
+
+    float sigma_x, sigma_y, rho;
+
+    float normal_map_std_slope_x_sqr = Normals2.x - Normals1.x * Normals1.x;
+    float normal_map_std_slope_y_sqr = Normals2.y - Normals1.y * Normals1.y;
+
+    normal_map_std_slope_x_sqr = clamp(normal_map_std_slope_x_sqr, 0.0001, 1.);
+    normal_map_std_slope_y_sqr = clamp(normal_map_std_slope_y_sqr, 0.0001, 1.);
+
+    float sigma_x_normals = sqrt(normal_map_std_slope_x_sqr);
+    float sigma_y_normals = sqrt(normal_map_std_slope_y_sqr);
+
+    float rho_normals = Normals2.z - Normals1.x * Normals1.y;
+    if(normal_map_std_slope_x_sqr == 0.0001 ||  normal_map_std_slope_y_sqr == 0.0001)
+    {
+        sigma_x_normals = 0.;
+        sigma_y_normals = 0.;
+        rho_normals = 0.;
+    }
+    else
+    {
+        rho_normals /= sigma_x_normals * sigma_y_normals;
+        rho_normals = clamp(rho_normals, -0.99, 0.99);
+    }
+
+    sigma_x = sqrt(sigma_x_mat*sigma_x_mat + sigma_x_normals*sigma_x_normals);
+    sigma_y = sqrt(sigma_y_mat*sigma_y_mat + sigma_y_normals*sigma_y_normals);
+    rho = (rho_mat * sigma_x_mat * sigma_y_mat + rho_normals * sigma_x_normals * sigma_y_normals) / (sigma_x * sigma_y) ;
+    
+    float D = f_P(V, L, float3(sigma_x, sigma_y, rho), density, GlintUV, ddx(GlintUV), ddy(GlintUV), false);
+
+    float3 H = normalize(V + L);
+    float3 wn = float3(-Normals1.x, -Normals1.y, 1.) / sqrt(1 + Normals1.x * Normals1.x + Normals1.y * Normals1.y);
+
+    float projected_area = clamp(dot(wn, V) / dot(wn, N), 1., 1000000000.);
+
+    float3 slope_projected_area = float3(Normals1, projected_area);
+
+    float h_dot_v = clamp(dot(V, H), 0., 1.);
+    float n_dot_l = dot(N, L);
+
+    float3 wh_shifted = shift_W(H, slope_projected_area.x, slope_projected_area.y);
+
+    // V-cavity masking shadowing
+    // V-cavity masking shadowing
+    //float G1wowh = min(1., 2. * H.z * V.z / dot(V, H));
+    //float G1wiwh = min(1., 2. * H.z * L.z / dot(L, H));
+    //float G = G1wowh * G1wiwh;
+    float G1wowh = min(1., 2. * wh_shifted.z * V.z / dot(V, wh_shifted));
+    float G1wiwh = n_dot_l > 0. ? min(1., 2. * wh_shifted.z * L.z / dot(L, wh_shifted)) : 0.;
+    float G = clamp(G1wowh * G1wiwh, 0., 1.);
+
+    // Fresnel
+    float3 F = F_Schlick(float3(1,1,1), NoV);
+
+    float3 GlintRes = slope_projected_area.z * (F * G * D) / 4.;
+
+    SurfaceColor += GlintRes;
+
+	// Luminance and transmitance assumin a full coverage of 1.
+	DualBlendSurfaceCoverage = 1.0f;
+	DualBlendSurfaceLuminancePostCoverage = SurfaceColor * DualBlendSurfaceCoverage;
+	DualBlendSurfaceTransmittancePreCoverage = 0; //Transmittance;
+}
+#endif
+
+
