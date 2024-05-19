@@ -1,0 +1,108 @@
+
+//...
+
+//=============================================================================
+//====YAKOV: Start of the contribution part 1==================================
+//=============================================================================
+
+float3 GlintyBeckmann( float Roughness, float3 SpecularColor, BxDFContext Context, float3 V, float3 L, FAreaLight AreaLight )
+{
+    FBeckmannDesc Beckmann = GGXToBeckmann(Roughness);
+    
+    // Generalized microfacet specular
+    float DVis = f_P(V, L, float3(Beckmann.Sigma.xx, Beckmann.Rho), 1.0f, float2(1.0f, 1.0f), float2(1.0f, 1.0f), float2(1.0f, 1.0f), true);
+    float3 F = F_Schlick( SpecularColor, Context.VoH );
+    
+
+#if MATERIAL_SHADINGMODEL_GLINTYWATER
+    return DVis * F;
+#endif
+    return DVis * F;
+}
+
+//=============================================================================
+//====YAKOV: End of the contribution part 1==================================
+//=============================================================================
+
+//...
+
+//=============================================================================
+//====YAKOV: Start of the contribution part 2==================================
+//=============================================================================
+
+FDirectLighting GlintyWaterBxDF( FGBufferData GBuffer, half3 N, half3 V, half3 L, float Falloff, half NoL, FAreaLight AreaLight, FShadowTerms Shadow )
+{
+	BxDFContext Context;
+	FDirectLighting Lighting;
+
+#if SUPPORTS_ANISOTROPIC_MATERIALS
+	bool bHasAnisotropy = HasAnisotropy(GBuffer.SelectiveOutputMask);
+#else
+	bool bHasAnisotropy = false;
+#endif
+
+	float NoV, VoH, NoH;
+	BRANCH
+	if (bHasAnisotropy)
+	{
+		half3 X = GBuffer.WorldTangent;
+		half3 Y = normalize(cross(N, X));
+		Init(Context, N, X, Y, V, L);
+
+		NoV = Context.NoV;
+		VoH = Context.VoH;
+		NoH = Context.NoH;
+	}
+	else
+	{
+#if SHADING_PATH_MOBILE
+		InitMobile(Context, N, V, L, NoL);
+#else
+		Init(Context, N, V, L);
+#endif
+
+		NoV = Context.NoV;
+		VoH = Context.VoH;
+		NoH = Context.NoH;
+
+		SphereMaxNoH(Context, AreaLight.SphereSinAlpha, true);
+	}
+
+	Context.NoV = saturate(abs( Context.NoV ) + 1e-5);
+    
+	Lighting.Diffuse = Diffuse_Lambert(GBuffer.DiffuseColor);
+	Lighting.Diffuse *= AreaLight.FalloffColor * (Falloff * NoL);
+    
+
+	BRANCH
+	if (bHasAnisotropy)
+	{
+		Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * GlintyBeckmann(GBuffer.Roughness, GBuffer.SpecularColor, Context, V, L, AreaLight); // TODO: aniso
+	}
+	else
+	{
+	    Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * GlintyBeckmann(GBuffer.Roughness, GBuffer.SpecularColor, Context, V, L, AreaLight);
+	}
+
+	/*FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
+
+	// Add energy presevation (i.e. attenuation of the specular layer onto the diffuse component
+	Lighting.Diffuse *= ComputeEnergyPreservation(EnergyTerms);
+
+	// Add specular microfacet multiple scattering term (energy-conservation)
+	Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);*/
+
+	Lighting.Transmission = 0;
+	return Lighting;
+}
+
+//=============================================================================
+//====YAKOV: End of the contribution part 2====================================
+//=============================================================================
+
+//...
+
+	    case SHADINGMODELID_GLINTYWATER:                                                 // YAKOV: Contribution part 3
+	        return GlintyWaterBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow ); // YAKOV: Contribution part 3
+
+//...

@@ -1,0 +1,921 @@
+From fb29f2873a959e61a11e87dfded6dd1c3c29e737 Mon Sep 17 00:00:00 2001
+From: YakovDavis <davyakov@gmail.com>
+Date: Sat, 18 May 2024 16:27:42 +0300
+Subject: [PATCH] Custom Glints for Unreal + fix for stats command
+
+---
+ .../ConsoleVariablesEditorCommandInfo.cpp     |  17 +-
+ .../Shaders/Private/BasePassPixelShader.usf   |  32 +++-
+ Engine/Shaders/Private/Definitions.usf        |   4 +
+ Engine/Shaders/Private/GlintyWaterCommon.ush  | 176 ++++++++++++++++++
+ .../Private/MobileBasePassPixelShader.usf     |   2 +-
+ Engine/Shaders/Private/ShadingCommon.ush      |   5 +-
+ Engine/Shaders/Private/ShadingModels.ush      |  84 +++++++++
+ .../Private/Strata/Glint/GlintThirdParty.ush  |  40 ++--
+ .../Private/PixelInspectorResult.cpp          |   2 +
+ .../Private/PixelInspectorResult.h            |   1 +
+ .../Engine/Classes/Engine/EngineTypes.h       |   1 +
+ ...aterialExpressionGlintyWaterCustomOutput.h |  41 ++++
+ .../MaterialExpressionShadingModel.h          |   2 +-
+ .../Materials/HLSLMaterialTranslator.cpp      |   8 +
+ .../Private/Materials/MaterialExpressions.cpp | 110 +++++++++++
+ .../Private/Materials/MaterialHLSLEmitter.cpp |   7 +
+ .../Private/Materials/MaterialShader.cpp      |   3 +-
+ .../ShaderCompiler/ShaderGenerationUtil.cpp   |   9 +
+ .../RenderCore/Public/ShaderMaterial.h        |   1 +
+ .../Renderer/Private/SceneRendering.cpp       |   4 +-
+ 20 files changed, 506 insertions(+), 43 deletions(-)
+ create mode 100644 Engine/Shaders/Private/GlintyWaterCommon.ush
+ create mode 100644 Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionGlintyWaterCustomOutput.h
+
+diff --git a/Engine/Plugins/Editor/ConsoleVariablesEditor/Source/ConsoleVariablesEditor/Private/ConsoleVariablesEditorCommandInfo.cpp b/Engine/Plugins/Editor/ConsoleVariablesEditor/Source/ConsoleVariablesEditor/Private/ConsoleVariablesEditorCommandInfo.cpp
+index c79e7d50c6ca..9ddc0be39ecc 100644
+--- a/Engine/Plugins/Editor/ConsoleVariablesEditor/Source/ConsoleVariablesEditor/Private/ConsoleVariablesEditorCommandInfo.cpp
++++ b/Engine/Plugins/Editor/ConsoleVariablesEditor/Source/ConsoleVariablesEditor/Private/ConsoleVariablesEditorCommandInfo.cpp
+@@ -59,13 +59,16 @@ IConsoleObject* FConsoleVariablesEditorCommandInfo::GetConsoleObjectPtr()
+ 	if (!ConsoleObjectPtr ||
+ 		(FDateTime::UtcNow() - TimeOfLastConsoleObjectRefresh).GetTotalSeconds() > ConsoleObjectRefreshThreshold)
+ 	{
+-		FString CommandKey = Command; 
+-		// Remove additional params, if they exist
+-		const int32 IndexOfSpace = CommandKey.Find(" ");
+-		if (IndexOfSpace != INDEX_NONE)
+-		{
+-			CommandKey = CommandKey.Left(IndexOfSpace).TrimStartAndEnd();
+-		}
++		FString CommandKey = Command;
++	    if (!CommandKey.ToLower().StartsWith("stat"))
++	    {
++	        // Remove additional params, if they exist unless it's a stat command, where param is part of the command
++	        const int32 IndexOfSpace = CommandKey.Find(" ");
++	        if (IndexOfSpace != INDEX_NONE)
++	        {
++	            CommandKey = CommandKey.Left(IndexOfSpace).TrimStartAndEnd();
++	        }
++	    }
+ 		
+ 		ConsoleObjectPtr = IConsoleManager::Get().FindConsoleObject(*CommandKey);
+ 		TimeOfLastConsoleObjectRefresh = FDateTime::UtcNow();
+diff --git a/Engine/Shaders/Private/BasePassPixelShader.usf b/Engine/Shaders/Private/BasePassPixelShader.usf
+index 1bcff1d3cb98..7019f09212ef 100644
+--- a/Engine/Shaders/Private/BasePassPixelShader.usf
++++ b/Engine/Shaders/Private/BasePassPixelShader.usf
+@@ -131,7 +131,7 @@
+ #define FORCE_FULLY_ROUGH (MATERIAL_FULLY_ROUGH)
+ #define EDITOR_ALPHA2COVERAGE (USE_EDITOR_COMPOSITING && SUPPORTS_PIXEL_COVERAGE)
+ #define POST_PROCESS_SUBSURFACE ((MATERIAL_SHADINGMODEL_SUBSURFACE_PROFILE || MATERIAL_SHADINGMODEL_EYE) && USES_GBUFFER)
+-#define MATERIAL_WORKS_WITH_DUAL_SOURCE_COLOR_BLENDING (MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || STRATA_BLENDING_TRANSLUCENT_COLOREDTRANSMITTANCE )
++#define MATERIAL_WORKS_WITH_DUAL_SOURCE_COLOR_BLENDING (MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER || STRATA_BLENDING_TRANSLUCENT_COLOREDTRANSMITTANCE )
+ #define OUTPUTS_COVERAGE (MATERIALBLENDING_MASKED_USING_COVERAGE && !EARLY_Z_PASS_ONLY_MATERIAL_MASKING)
+ 
+ #define OIT_ENABLED (PROJECT_OIT && PLATFORM_SUPPORTS_ROV && (MATERIALBLENDING_TRANSLUCENT || MATERIALBLENDING_ADDITIVE || MATERIAL_WORKS_WITH_DUAL_SOURCE_COLOR_BLENDING))
+@@ -163,6 +163,8 @@
+ 
+ #include "ThinTranslucentCommon.ush"
+ 
++#include "GlintyWaterCommon.ush"
++
+ #if TRANSLUCENCY_LIGHTING_SURFACE_LIGHTINGVOLUME || TRANSLUCENCY_LIGHTING_SURFACE_FORWARDSHADING || FORWARD_SHADING || MATERIAL_SHADINGMODEL_SINGLELAYERWATER || STRATA_TRANSLUCENT_FORWARD || STRATA_FORWARD_SHADING
+ // Enables applying a cloud shadow factor to lighting calculations in ForwardLightingCommon.ush.
+ #define ENABLE_FORWARD_CLOUD_SHADOW NEEDS_BASEPASS_CLOUD_SHADOW_INTERPOLATOR
+@@ -1250,7 +1252,7 @@ void FPixelShaderInOut_MainPS(
+ 						bSeparateWaterMainDirLightLuminance, SeparatedWaterMainDirLightLuminance,
+ 						bSkipMainDirLightVirtualShadowMapEvaluation);
+ 					
+-					#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
++					#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER
+ 						DiffuseColor += ForwardDirectLighting.DiffuseLighting.rgb;
+ 						ColorSeparateSpecular += ForwardDirectLighting.SpecularLighting.rgb;
+ 					#else
+@@ -1269,7 +1271,7 @@ void FPixelShaderInOut_MainPS(
+ 						* IndirectOcclusion
+ 						* AOMultiBounce(GBuffer.SpecularColor, ShadingOcclusion.SpecOcclusion);
+ 
+-					#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
++					#if MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER
+ 						ColorSeparateSpecular += ReflectionColor;
+ 					#else
+ 						Color += ReflectionColor;
+@@ -1409,13 +1411,13 @@ void FPixelShaderInOut_MainPS(
+ 
+ #if !STRATA_ENABLED || STRATA_INLINE_SINGLELAYERWATER
+ 
+-#if !POST_PROCESS_SUBSURFACE && !MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
++#if !POST_PROCESS_SUBSURFACE && !(MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER)
+  	// For skin we need to keep them separate. We also keep them separate for thin translucent.
+ 	// Otherwise just add them together.
+ 	Color += DiffuseColor;
+ #endif
+ 
+-#if !MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
++#if !(MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER)
+ 	Color += Emissive;
+ #endif
+ 
+@@ -1485,6 +1487,24 @@ void FPixelShaderInOut_MainPS(
+ 		Opacity = 1.0f;
+ 	}
+ #endif // MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT
++    
++#if MATERIAL_SHADINGMODEL_GLINTYWATER && !STRATA_ENABLED
++	{
++		AccumulateGlintyWaterModel(
++								DualBlendSurfaceLuminancePostCoverage,
++								DualBlendSurfaceTransmittancePreCoverage,
++								DualBlendSurfaceCoverage,
++								MaterialParameters,
++								GBuffer,
++								DiffuseColor,
++								ColorSeparateSpecular,
++								Emissive,
++								Opacity);
++
++		Color = 0;
++		Opacity = 1.0f;
++	}
++#endif // MATERIAL_SHADINGMODEL_GLINTYWATER
+ 
+ #if STRATA_MATERIAL_EXPORT_EXECUTED
+ 	float4 StrataMaterialExport = float4(0, 0, 0, 0);
+@@ -2018,7 +2038,7 @@ void FPixelShaderInOut_MainPS(
+ 	// diffuse to specular lighting will get messed up in the SSS pass.
+ 	// RGB: Full color (Diffuse + Specular)
+ 	// A:   Diffuse Intensity, but only if we are not blending
+-	#if MATERIAL_DOMAIN_POSTPROCESS || MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIALBLENDING_ALPHAHOLDOUT || MATERIALBLENDING_ALPHACOMPOSITE || MATERIALBLENDING_TRANSLUCENT || MATERIALBLENDING_ADDITIVE
++	#if MATERIAL_DOMAIN_POSTPROCESS || MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER || MATERIALBLENDING_ALPHAHOLDOUT || MATERIALBLENDING_ALPHACOMPOSITE || MATERIALBLENDING_TRANSLUCENT || MATERIALBLENDING_ADDITIVE
+ 		Out.MRT[0].rgb  *= ViewPreExposure;
+ 	#else
+ 		Out.MRT[0].rgba *= ViewPreExposure;
+diff --git a/Engine/Shaders/Private/Definitions.usf b/Engine/Shaders/Private/Definitions.usf
+index f9fa712f4c7d..a122005aebed 100644
+--- a/Engine/Shaders/Private/Definitions.usf
++++ b/Engine/Shaders/Private/Definitions.usf
+@@ -116,6 +116,10 @@
+ #define	MATERIAL_SHADINGMODEL_UNLIT						0
+ #endif
+ 
++#ifndef MATERIAL_SHADINGMODEL_GLINTYWATER
++#define MATERIAL_SHADINGMODEL_GLINTYWATER				0
++#endif
++
+ #ifndef MATERIAL_SHADINGMODEL_SINGLELAYERWATER
+ #define MATERIAL_SHADINGMODEL_SINGLELAYERWATER			0 
+ #endif
+diff --git a/Engine/Shaders/Private/GlintyWaterCommon.ush b/Engine/Shaders/Private/GlintyWaterCommon.ush
+new file mode 100644
+index 000000000000..1e2fb06ef0a2
+--- /dev/null
++++ b/Engine/Shaders/Private/GlintyWaterCommon.ush
+@@ -0,0 +1,176 @@
++﻿// Copyright Epic Games, Inc. All Rights Reserved.
++
++#include "ShadingCommon.ush"
++#include "Strata/Glint/GlintThirdParty.ush"
++
++#pragma once
++
++#if MATERIAL_SHADINGMODEL_GLINTYWATER
++
++//=============================================================================
++//======== Tangent space maths ================================================
++//=============================================================================
++float get_cos_theta(const float3 w)       {return w.z;}
++float get_cos_2_theta(const float3 w)     {return w.z*w.z;}
++float get_sin_2_theta(const float3 w)     {return max(0.f, 1.f - get_cos_2_theta(w));}
++float get_sin_theta(const float3 w)       {return sqrt(get_sin_2_theta(w));}
++float get_tan_theta(const float3 w)       {return get_sin_theta(w) / get_cos_theta(w);}
++float get_cos_phi(const float3 w)         {return (get_sin_theta(w) == 0.f) ? 1.f : clamp(w.x / get_sin_theta(w), -1.f, 1.f);}
++float get_sin_phi(const float3 w)         {return (get_sin_theta(w) == 0.f) ? 0.f : clamp(w.y / get_sin_theta(w), -1.f, 1.f);}
++float get_cos_2_phi(const float3 w)       {return get_cos_phi(w) * get_cos_phi(w);}
++float get_sin_2_phi(const float3 w)       {return get_sin_phi(w) * get_sin_phi(w);} 
++
++//=============================================================================
++//======== Shifting view/incident direction for off-center V-cavity ===========
++//=============================================================================
++float3 shift_W(float3 w, // vector to be transformed
++             float x0, float y0 // average slope
++             )
++{
++    float3 shifted_w = float3(0., 0., 0.);
++
++    float cos_phi = get_cos_phi(w);
++    float sin_phi = get_sin_phi(w);
++    float tan_theta = get_tan_theta(w);
++
++    float2 w_xy = normalize(float2(cos_phi, sin_phi)); // vector projected in tangent space XY
++    float mu_phi = w_xy.x * x0 + w_xy.y * y0;
++
++    float cos_mu_phi = cos(mu_phi);
++    float sin_mu_phi = sin(mu_phi);
++
++    float w_z = 1. / tan_theta;
++
++    shifted_w.xy = w_xy;
++
++    float w_xy_length = length(w_xy);
++
++    float shifted_w_z = 0.;
++    if (cos_mu_phi < 0.) {
++        shifted_w_z = w_xy_length * (w_xy_length * cos_mu_phi - w_z * sin_mu_phi) / (w_z * cos_mu_phi + w_xy_length * sin_mu_phi);
++    }
++    else
++    {
++        shifted_w_z = w_xy_length * (w_z * cos_mu_phi + w_xy_length * sin_mu_phi) / (w_xy_length * cos_mu_phi - w_z * sin_mu_phi);
++    }
++
++    return normalize(float3(w_xy, shifted_w_z));
++}
++
++float3x3 make_tbn(float3 n)
++{
++    float3 t,b;
++    float a0 = 1.0f / (1.0f + n.z);
++    float b0 = -n.x * n.y * a0;
++    t = normalize(float3(1.0f -n.x * n.x * a0, b0, -n.x));
++    b = normalize(float3(b0, 1.0f -n.y * n.y * a0, -n.y));
++    return float3x3(t,b,n);
++}
++
++void AccumulateGlintyWaterModel(inout float3 DualBlendSurfaceLuminancePostCoverage,
++								inout float3 DualBlendSurfaceTransmittancePreCoverage,
++								inout float DualBlendSurfaceCoverage,
++								FMaterialPixelParameters MaterialParams,
++								FGBufferData GBuffer,
++								float3 DiffuseColor,
++								float3 SpecularColor,
++								float3 EmissiveColor,
++								float TopMaterialCoverage)
++{
++    const float3x3 WorldToTangent = make_tbn(MaterialParams.WorldNormal);
++    
++	const float3 N = MaterialParams.WorldNormal;
++	const float3 V = MaterialParams.CameraVector;
++    const float3 L = GetGlintyWaterParams4(MaterialParams).xyz;
++
++    const float3 wg = float3(0.0f, 0.0f, 1.0f); //normalize(mul(N, WorldToTangent));
++    const float3 wo = normalize(mul(V, WorldToTangent));
++    const float3 wi = normalize(mul(L, WorldToTangent));
++
++	const float NoV = saturate( abs( dot(N, V) ) + 1e-5 );
++
++	// how much to multiply the background color by
++	float3 Transmittance = float3(1.0,1.0,1.0);
++
++	// how much to add for foreground color
++	float3 SurfaceColor = float3(0.0f,0.0f,0.0f);
++
++	float2 GlintUV = GetGlintyWaterParams0(MaterialParams);
++
++    float2 Normals1 = GetGlintyWaterParams1(MaterialParams).xy;
++    float3 Normals2 = GetGlintyWaterParams2(MaterialParams).xyz;
++    
++    SurfaceColor = DiffuseColor + EmissiveColor;
++    
++    float3 SigmasRho = GetGlintyWaterParams3(MaterialParams);
++    float sigma_x_mat = SigmasRho.x;
++    float sigma_y_mat = SigmasRho.y;
++    float rho_mat = SigmasRho.z;
++    float density = GetGlintyWaterParams5(MaterialParams);
++
++    float sigma_x, sigma_y, rho;
++
++    float normal_map_std_slope_x_sqr = Normals2.x - Normals1.x * Normals1.x;
++    float normal_map_std_slope_y_sqr = Normals2.y - Normals1.y * Normals1.y;
++
++    normal_map_std_slope_x_sqr = clamp(normal_map_std_slope_x_sqr, 0.0001, 1.);
++    normal_map_std_slope_y_sqr = clamp(normal_map_std_slope_y_sqr, 0.0001, 1.);
++
++    float sigma_x_normals = sqrt(normal_map_std_slope_x_sqr);
++    float sigma_y_normals = sqrt(normal_map_std_slope_y_sqr);
++
++    float rho_normals = Normals2.z - Normals1.x * Normals1.y;
++    if(normal_map_std_slope_x_sqr == 0.0001 ||  normal_map_std_slope_y_sqr == 0.0001)
++    {
++        sigma_x_normals = 0.;
++        sigma_y_normals = 0.;
++        rho_normals = 0.;
++    }
++    else
++    {
++        rho_normals /= sigma_x_normals * sigma_y_normals;
++        rho_normals = clamp(rho_normals, -0.99, 0.99);
++    }
++
++    sigma_x = sqrt(sigma_x_mat*sigma_x_mat + sigma_x_normals*sigma_x_normals);
++    sigma_y = sqrt(sigma_y_mat*sigma_y_mat + sigma_y_normals*sigma_y_normals);
++    rho = (rho_mat * sigma_x_mat * sigma_y_mat + rho_normals * sigma_x_normals * sigma_y_normals) / (sigma_x * sigma_y) ;
++
++    sigma_x = clamp(sigma_x, 0.01f, 1.f);
++    sigma_y = clamp(sigma_y, 0.01f, 1.f);
++    rho = clamp(rho, -0.99f, 0.99f);
++    
++    float D = f_P(wo, wi, float3(sigma_x, sigma_y, rho), density, GlintUV, ddx(GlintUV), ddy(GlintUV), false);
++
++    float3 wh = normalize(wo + wi);
++    float3 wn = float3(-Normals1.x, -Normals1.y, 1.) / sqrt(1 + Normals1.x * Normals1.x + Normals1.y * Normals1.y);
++
++    float projected_area = clamp(dot(wn, wo) / dot(wn, wg), 1., 1000000000.);
++
++    float3 slope_projected_area = float3(Normals1, projected_area);
++
++    float h_dot_v = clamp(dot(wo, wh), 0., 1.);
++    float n_dot_l = dot(N, L);
++
++    float3 wh_shifted = shift_W(wh, slope_projected_area.x, slope_projected_area.y);
++
++    // V-cavity masking shadowing
++    float G1wowh = min(1., 2. * wh_shifted.z * wo.z / dot(wo, wh_shifted));
++    float G1wiwh = n_dot_l > 0. ? min(1., 2. * wh_shifted.z * wi.z / dot(wi, wh_shifted)) : 0.;
++    float G = clamp(G1wowh * G1wiwh, 0., 1.);
++
++    // Fresnel
++    float3 F = F_Schlick(float3(1,1,1), NoV);
++
++    float3 GlintRes = slope_projected_area.z * (F * G * D) / 4.;
++
++    SurfaceColor += GlintRes;
++
++	// Luminance and transmitance assumin a full coverage of 1.
++	DualBlendSurfaceCoverage = 1.0f;
++	DualBlendSurfaceLuminancePostCoverage = SurfaceColor * DualBlendSurfaceCoverage;
++	DualBlendSurfaceTransmittancePreCoverage = 0; //Transmittance;
++}
++#endif
++
++
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index 67f552b1b90a..f09df209f58f 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -77,7 +77,7 @@
+ #define FORCE_VERTEX_NORMAL (MOBILE_QL_DISABLE_MATERIAL_NORMAL)
+ #define SUPPORT_SPOTLIGHTS_SHADOW (MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && PROJECT_MOBILE_ENABLE_MOVABLE_SPOTLIGHT_SHADOWS
+ #define DEFERRED_SHADING_PATH (MOBILE_DEFERRED_SHADING && ((MATERIALBLENDING_SOLID || MATERIALBLENDING_MASKED) && !MATERIAL_SHADINGMODEL_SINGLELAYERWATER))
+-#define MATERIAL_WORKS_WITH_DUAL_SOURCE_COLOR_BLENDING (MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || STRATA_BLENDING_TRANSLUCENT_COLOREDTRANSMITTANCE )
++#define MATERIAL_WORKS_WITH_DUAL_SOURCE_COLOR_BLENDING (MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT || MATERIAL_SHADINGMODEL_GLINTYWATER || STRATA_BLENDING_TRANSLUCENT_COLOREDTRANSMITTANCE )
+ 
+ // Force FORWARD_SHADING on mobile when MOBILE_DEFERRED_SHADING is disabled
+ #ifndef FORWARD_SHADING
+diff --git a/Engine/Shaders/Private/ShadingCommon.ush b/Engine/Shaders/Private/ShadingCommon.ush
+index 2bef75397e16..743e545ccacc 100644
+--- a/Engine/Shaders/Private/ShadingCommon.ush
++++ b/Engine/Shaders/Private/ShadingCommon.ush
+@@ -30,7 +30,8 @@
+ #define SHADINGMODELID_SINGLELAYERWATER		10
+ #define SHADINGMODELID_THIN_TRANSLUCENT		11
+ #define SHADINGMODELID_STRATA				12		// Temporary while we convert everything to Strata
+-#define SHADINGMODELID_NUM					13
++#define SHADINGMODELID_GLINTYWATER			13
++#define SHADINGMODELID_NUM					14
+ #define SHADINGMODELID_MASK					0xF		// 4 bits reserved for ShadingModelID			
+ 
+ // The flags are defined so that 0 value has no effect!
+@@ -62,6 +63,7 @@ float3 GetShadingModelColor(uint ShadingModelID)
+ 	else if (ShadingModelID == SHADINGMODELID_SINGLELAYERWATER) return float3(0.5f, 0.5f, 1.0f);
+ 	else if (ShadingModelID == SHADINGMODELID_THIN_TRANSLUCENT) return float3(1.0f, 0.8f, 0.3f);
+ 	else if (ShadingModelID == SHADINGMODELID_STRATA) return float3(1.0f, 1.0f, 0.0f);
++	else if (ShadingModelID == SHADINGMODELID_GLINTYWATER) return float3(0.1f, 0.1f, 0.4f);
+ 	else return float3(1.0f, 1.0f, 1.0f); // White
+ #else
+ 	switch(ShadingModelID)
+@@ -79,6 +81,7 @@ float3 GetShadingModelColor(uint ShadingModelID)
+ 		case SHADINGMODELID_SINGLELAYERWATER: return float3(0.5f, 0.5f, 1.0f);
+ 		case SHADINGMODELID_THIN_TRANSLUCENT: return float3(1.0f, 0.8f, 0.3f);
+ 		case SHADINGMODELID_STRATA: return float3(1.0f, 1.0f, 0.0f);
++		case SHADINGMODELID_GLINTYWATER: return float3(0.1f, 0.1f, 0.4f);
+ 		default: return float3(1.0f, 1.0f, 1.0f); // White
+ 	}
+ #endif
+diff --git a/Engine/Shaders/Private/ShadingModels.ush b/Engine/Shaders/Private/ShadingModels.ush
+index e2c2261bf1fb..ca2f5718aede 100644
+--- a/Engine/Shaders/Private/ShadingModels.ush
++++ b/Engine/Shaders/Private/ShadingModels.ush
+@@ -13,6 +13,7 @@
+ #include "ShadingEnergyConservation.ush"
+ #include "ParticipatingMediaCommon.ush"
+ #include "ColorSpace.ush"
++#include "Strata/Glint/GlintThirdParty.ush"
+ 
+ #if SHADING_PATH_MOBILE
+ #include "MobileGGX.ush"
+@@ -238,6 +239,21 @@ float3 SpecularGGX( float Roughness, float3 SpecularColor, BxDFContext Context,
+ #endif
+ }
+ 
++float3 GlintyBeckmann( float Roughness, float3 SpecularColor, BxDFContext Context, float3 V, float3 L, FAreaLight AreaLight )
++{
++    FBeckmannDesc Beckmann = GGXToBeckmann(Roughness);
++    
++    // Generalized microfacet specular
++    float DVis = f_P(V, L, float3(Beckmann.Sigma.xx, Beckmann.Rho), 1.0f, float2(1.0f, 1.0f), float2(1.0f, 1.0f), float2(1.0f, 1.0f), true);
++    float3 F = F_Schlick( SpecularColor, Context.VoH );
++    
++
++#if MATERIAL_SHADINGMODEL_GLINTYWATER
++    return DVis * F;
++#endif
++    return DVis * F;
++}
++
+ half3 DualSpecularGGX(half AverageRoughness, half Lobe0Roughness, half Lobe1Roughness, half LobeMix, half3 SpecularColor, BxDFContext Context, half NoL, FAreaLight AreaLight)
+ {
+ 	float AverageAlpha2 = Pow4(AverageRoughness);
+@@ -958,6 +974,72 @@ FDirectLighting PreintegratedSkinBxDF( FGBufferData GBuffer, half3 N, half3 V, h
+ 	return Lighting;
+ }
+ 
++FDirectLighting GlintyWaterBxDF( FGBufferData GBuffer, half3 N, half3 V, half3 L, float Falloff, half NoL, FAreaLight AreaLight, FShadowTerms Shadow )
++{
++	BxDFContext Context;
++	FDirectLighting Lighting;
++
++#if SUPPORTS_ANISOTROPIC_MATERIALS
++	bool bHasAnisotropy = HasAnisotropy(GBuffer.SelectiveOutputMask);
++#else
++	bool bHasAnisotropy = false;
++#endif
++
++	float NoV, VoH, NoH;
++	BRANCH
++	if (bHasAnisotropy)
++	{
++		half3 X = GBuffer.WorldTangent;
++		half3 Y = normalize(cross(N, X));
++		Init(Context, N, X, Y, V, L);
++
++		NoV = Context.NoV;
++		VoH = Context.VoH;
++		NoH = Context.NoH;
++	}
++	else
++	{
++#if SHADING_PATH_MOBILE
++		InitMobile(Context, N, V, L, NoL);
++#else
++		Init(Context, N, V, L);
++#endif
++
++		NoV = Context.NoV;
++		VoH = Context.VoH;
++		NoH = Context.NoH;
++
++		SphereMaxNoH(Context, AreaLight.SphereSinAlpha, true);
++	}
++
++	Context.NoV = saturate(abs( Context.NoV ) + 1e-5);
++    
++	Lighting.Diffuse = Diffuse_Lambert(GBuffer.DiffuseColor);
++	Lighting.Diffuse *= AreaLight.FalloffColor * (Falloff * NoL);
++    
++
++	BRANCH
++	if (bHasAnisotropy)
++	{
++		Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * GlintyBeckmann(GBuffer.Roughness, GBuffer.SpecularColor, Context, V, L, AreaLight); // TODO: aniso
++	}
++	else
++	{
++	    Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * GlintyBeckmann(GBuffer.Roughness, GBuffer.SpecularColor, Context, V, L, AreaLight);
++	}
++
++	/*FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
++
++	// Add energy presevation (i.e. attenuation of the specular layer onto the diffuse component
++	Lighting.Diffuse *= ComputeEnergyPreservation(EnergyTerms);
++
++	// Add specular microfacet multiple scattering term (energy-conservation)
++	Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);*/
++
++	Lighting.Transmission = 0;
++	return Lighting;
++}
++
+ FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, half3 L, float Falloff, half NoL, FAreaLight AreaLight, FShadowTerms Shadow )
+ {
+ 	switch( GBuffer.ShadingModelID )
+@@ -982,6 +1064,8 @@ FDirectLighting IntegrateBxDF( FGBufferData GBuffer, half3 N, half3 V, half3 L,
+ 			return ClothBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow );
+ 		case SHADINGMODELID_EYE:
+ 			return EyeBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow );
++	    case SHADINGMODELID_GLINTYWATER:
++	        return GlintyWaterBxDF( GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow );
+ 		default:
+ 			return (FDirectLighting)0;
+ 	}
+diff --git a/Engine/Shaders/Private/Strata/Glint/GlintThirdParty.ush b/Engine/Shaders/Private/Strata/Glint/GlintThirdParty.ush
+index c9b55de1e9d2..564aa68de939 100644
+--- a/Engine/Shaders/Private/Strata/Glint/GlintThirdParty.ush
++++ b/Engine/Shaders/Private/Strata/Glint/GlintThirdParty.ush
+@@ -43,6 +43,18 @@ FGlintLutParams GetGlintParams()
+ 	GlintLutParams.LevelMin		= Params1.x;
+ 	return GlintLutParams;
+ }
++/*
++FGlintLutParams GetGlintParams()
++{
++    FGlintLutParams GlintLutParams;
++    GlintLutParams.Alpha		= 0.5f;
++    GlintLutParams.N			= 64;
++    GlintLutParams.NLevels		= 16;
++    GlintLutParams.LevelBias	= 0;
++    GlintLutParams.LevelMin		= 0;
++    return GlintLutParams;
++}
++*/
+ 
+ #define USE_GLINT_AA (!RAYCALLABLESHADER && !RAYHITGROUPSHADER && !RAYGENSHADER && !RAYMISSSHADER)
+ 
+@@ -525,28 +537,8 @@ float f_P(float3 wo, float3 wi, float3 sigmas_rho, float LogMicrofacetDensity, f
+ 
+ 		D_P = P22_P / (wh.z * wh.z * wh.z * wh.z);
+ 	}
+-
+-//	// V-cavity masking shadowing
+-//	float G1wowh = min(1., 2. * wh.z * wo.z / dot(wo, wh));
+-//	float G1wiwh = min(1., 2. * wh.z * wi.z / dot(wi, wh));
+-//	float G = G1wowh * G1wiwh;																						// TODO check 
+-//
+-//	// Fresnel is set to one for simplicity
+-//	// but feel free to use "real" Fresnel term
+-//	float3 F = float3(1.0f, 1.0f, 1.0f);																			// TODO check
+-//
+-//	// (wi dot wg) is cancelled by
+-//	// the cosine weight in the rendering equation
+-//	return (F * G * D_P) / (4. * wo.z);
+-
+-	float G = 1.f;
+-	if (bIncludeGeometryTerm)
+-	{
+-		float G1wowh = min(1., 2. * wh.z * wo.z / dot(wo, wh));
+-		float G1wiwh = min(1., 2. * wh.z * wi.z / dot(wi, wh));
+-		G = G1wowh * G1wiwh;																						// TODO check 
+-	}
+-	return G * D_P / (4. * wo.z);
++    
++	return D_P;
+ }
+ 
+ // Glint Sampling
+@@ -878,8 +870,8 @@ float3 Sample_P(float3 u, float3 wo, float3 sigmas_rho, float LogMicrofacetDensi
+ 		float LOD_dist_ilp1 = log(n_ilp1) / 1.38629; // 2. * log(2) = 1.38629
+ 
+ 		// Apply here level space bias and clamp to a minimum. This before we evaluate each glint level.
+-		LOD_dist_il   = clamp(LOD_dist_il   + GlintLutParams.LevelBias, 0, max(0, GlintLutParams.NLevels - GlintLutParams.LevelMin));
+-		LOD_dist_ilp1 = clamp(LOD_dist_ilp1 + GlintLutParams.LevelBias, 0, max(0, GlintLutParams.NLevels - GlintLutParams.LevelMin));
++		//LOD_dist_il   = clamp(LOD_dist_il   + GlintLutParams.LevelBias, 0, max(0, GlintLutParams.NLevels - GlintLutParams.LevelMin));
++		//LOD_dist_ilp1 = clamp(LOD_dist_ilp1 + GlintLutParams.LevelBias, 0, max(0, GlintLutParams.NLevels - GlintLutParams.LevelMin));
+ 
+ 		// 1. Select LOD (N or N+1)
+ 		uint LOD = il;
+diff --git a/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.cpp b/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.cpp
+index 026b74262968..23dd4b39c401 100644
+--- a/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.cpp
++++ b/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.cpp
+@@ -267,6 +267,8 @@ namespace PixelInspector
+ 			return EMaterialShadingModel::MSM_ThinTranslucent;
+ 		case PIXEL_INSPECTOR_SHADINGMODELID_STRATA:
+ 			return EMaterialShadingModel::MSM_Strata;
++		case PIXEL_INSPECTOR_SHADINGMODELID_GLINTYWATER:
++		    return EMaterialShadingModel::MSM_GlintyWater;
+ 		};
+ 		return EMaterialShadingModel::MSM_DefaultLit;
+ 	}
+diff --git a/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.h b/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.h
+index 4b79f5543e58..b52a8eedd82a 100644
+--- a/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.h
++++ b/Engine/Source/Editor/PixelInspector/Private/PixelInspectorResult.h
+@@ -25,6 +25,7 @@ class FFloat16Color;
+ #define PIXEL_INSPECTOR_SHADINGMODELID_SINGLELAYERWATER 10
+ #define PIXEL_INSPECTOR_SHADINGMODELID_THIN_TRANSLUCENT 11
+ #define PIXEL_INSPECTOR_SHADINGMODELID_STRATA 12
++#define PIXEL_INSPECTOR_SHADINGMODELID_GLINTYWATER 13
+ #define PIXEL_INSPECTOR_SHADINGMODELID_MASK 0xF
+ 
+ namespace PixelInspector
+diff --git a/Engine/Source/Runtime/Engine/Classes/Engine/EngineTypes.h b/Engine/Source/Runtime/Engine/Classes/Engine/EngineTypes.h
+index 429780cbfa0f..f24681c62d02 100644
+--- a/Engine/Source/Runtime/Engine/Classes/Engine/EngineTypes.h
++++ b/Engine/Source/Runtime/Engine/Classes/Engine/EngineTypes.h
+@@ -634,6 +634,7 @@ enum EMaterialShadingModel : int
+ 	MSM_SingleLayerWater		UMETA(DisplayName="SingleLayerWater"),
+ 	MSM_ThinTranslucent			UMETA(DisplayName="Thin Translucent"),
+ 	MSM_Strata					UMETA(DisplayName="Substrate", Hidden),
++    MSM_GlintyWater				UMETA(DisplayName = "Glinty Water"),
+ 	/** Number of unique shading models. */
+ 	MSM_NUM						UMETA(Hidden),
+ 	/** Shading model will be determined by the Material Expression Graph,
+diff --git a/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionGlintyWaterCustomOutput.h b/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionGlintyWaterCustomOutput.h
+new file mode 100644
+index 000000000000..767150961a3f
+--- /dev/null
++++ b/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionGlintyWaterCustomOutput.h
+@@ -0,0 +1,41 @@
++﻿#pragma once
++ 
++#include "CoreMinimal.h"
++#include "UObject/ObjectMacros.h"
++#include "MaterialExpressionIO.h"
++#include "Materials/MaterialExpressionCustomOutput.h"
++#include "MaterialExpressionGlintyWaterCustomOutput.generated.h"
++ 
++UCLASS()
++class UMaterialExpressionGlintyWaterOutput : public UMaterialExpressionCustomOutput
++{
++    GENERATED_UCLASS_BODY()
++ 
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput TexCoordInput;
++
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput Normal1Input;
++
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput Normal2Input;
++
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput SigmasRho;
++
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput LightVector;
++
++    UPROPERTY(meta = (RequiredInput = "true"))
++    FExpressionInput Density;
++ 
++#if WITH_EDITOR
++    virtual int32 Compile(class FMaterialCompiler* Compiler, int32 OutputIndex) override;
++    virtual void GetCaption(TArray<FString>& OutCaptions) const override;
++    virtual uint32 GetInputType(int32 InputIndex) override;
++    virtual FExpressionInput* GetInput(int32 InputIndex) override;
++#endif
++    virtual int32 GetNumOutputs() const override { return 6; }
++    virtual FString GetFunctionName() const override { return TEXT("GetGlintyWaterParams"); }
++    virtual FString GetDisplayName() const override { return TEXT("Glinty Water Params"); }
++};
+\ No newline at end of file
+diff --git a/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionShadingModel.h b/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionShadingModel.h
+index 64d438d4401d..b1df1e87eb5d 100644
+--- a/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionShadingModel.h
++++ b/Engine/Source/Runtime/Engine/Classes/Materials/MaterialExpressionShadingModel.h
+@@ -33,7 +33,7 @@ class UMaterialExpressionShadingModel : public UMaterialExpression
+ 	virtual bool GenerateHLSLExpression(FMaterialHLSLGenerator& Generator, UE::HLSLTree::FScope& Scope, int32 OutputIndex, UE::HLSLTree::FExpression const*& OutExpression) const override;
+ #endif
+ public:
+-	UPROPERTY(EditAnywhere, Category=ShadingModel,  meta=(ValidEnumValues="MSM_DefaultLit, MSM_Subsurface, MSM_PreintegratedSkin, MSM_ClearCoat, MSM_SubsurfaceProfile, MSM_TwoSidedFoliage, MSM_Hair, MSM_Cloth, MSM_Eye", ShowAsInputPin = "Primary"))
++	UPROPERTY(EditAnywhere, Category=ShadingModel,  meta=(ValidEnumValues="MSM_DefaultLit, MSM_Subsurface, MSM_PreintegratedSkin, MSM_ClearCoat, MSM_SubsurfaceProfile, MSM_TwoSidedFoliage, MSM_Hair, MSM_Cloth, MSM_Eye, MSM_GlintyWater", ShowAsInputPin = "Primary"))
+ 	TEnumAsByte<enum EMaterialShadingModel> ShadingModel = MSM_DefaultLit;
+ 	//~ End UMaterialExpression Interface
+ };
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp b/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
+index d88f783fcf75..2e5fa52e55b3 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/HLSLMaterialTranslator.cpp
+@@ -2209,6 +2209,14 @@ void FHLSLMaterialTranslator::GetMaterialEnvironment(EShaderPlatform InPlatform,
+ 
+ 			bMaterialRequestsDualSourceBlending = true;
+ 		}
++	    if (ShadingModels.HasShadingModel(MSM_GlintyWater))
++	    {
++	        OutEnvironment.SetDefine(TEXT("MATERIAL_SHADINGMODEL_GLINTYWATER"), TEXT("1"));
++	        NumSetMaterials++;
++
++	        bMaterialRequestsDualSourceBlending = true;
++	    }
++ 
+ 
+ 		if (ShadingModels.HasShadingModel(MSM_SingleLayerWater) && FDataDrivenShaderPlatformInfo::GetRequiresDisableForwardLocalLights(Platform))
+ 		{
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/MaterialExpressions.cpp b/Engine/Source/Runtime/Engine/Private/Materials/MaterialExpressions.cpp
+index 46ff45026b74..47ef747e7e5c 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/MaterialExpressions.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/MaterialExpressions.cpp
+@@ -282,6 +282,7 @@
+ #include "Materials/MaterialExpressionSparseVolumeTextureBase.h"
+ #include "Materials/MaterialExpressionSparseVolumeTextureObject.h"
+ #include "Materials/MaterialExpressionSparseVolumeTextureSample.h"
++#include "Materials/MaterialExpressionGlintyWaterCustomOutput.h"
+ #include "EditorSupportDelegates.h"
+ #if WITH_EDITOR
+ #include "MaterialGraph/MaterialGraphNode_Comment.h"
+@@ -21349,6 +21350,115 @@ FExpressionInput* UMaterialExpressionBentNormalCustomOutput::GetInput(int32 Inpu
+ }
+ #endif // WITH_EDITOR
+ 
++///////////////////////////////////////////////////////////////////////////////
++// Glinty Water Params
++///////////////////////////////////////////////////////////////////////////////
++
++UMaterialExpressionGlintyWaterOutput::UMaterialExpressionGlintyWaterOutput(const FObjectInitializer& ObjectInitializer)
++    : Super(ObjectInitializer)
++{
++#if WITH_EDITORONLY_DATA
++    // Structure to hold one-time initialization
++    struct FConstructorStatics
++    {
++        FText NAME_Utility;
++        FConstructorStatics(const FString& DisplayName, const FString& FunctionName)
++            : NAME_Utility(LOCTEXT("Utility", "Utility"))
++        {
++        }
++    };
++    static FConstructorStatics ConstructorStatics(GetDisplayName(), GetFunctionName());
++
++    MenuCategories.Add(ConstructorStatics.NAME_Utility);
++
++    bCollapsed = true;
++
++    // No outputs
++    Outputs.Reset();
++#endif
++}
++
++#if WITH_EDITOR
++int32  UMaterialExpressionGlintyWaterOutput::Compile(class FMaterialCompiler* Compiler, int32 OutputIndex)
++{
++    int32 CodeInput = INDEX_NONE;
++    
++    if (OutputIndex == 0)
++    {
++        CodeInput = TexCoordInput.Compile(Compiler);
++    }
++    else if (OutputIndex == 1)
++    {
++        CodeInput = Normal1Input.Compile(Compiler);
++    }
++    else if (OutputIndex == 2)
++    {
++        CodeInput = Normal2Input.Compile(Compiler);
++    }
++    else if (OutputIndex == 3)
++    {
++        CodeInput = SigmasRho.Compile(Compiler);
++    }
++    else if (OutputIndex == 4)
++    {
++        CodeInput = LightVector.Compile(Compiler);
++    }
++    else if (OutputIndex == 5)
++    {
++        CodeInput = Density.Compile(Compiler);
++    }
++
++    return Compiler->CustomOutput(this, OutputIndex, CodeInput);
++}
++
++
++void UMaterialExpressionGlintyWaterOutput::GetCaption(TArray<FString>& OutCaptions) const
++{
++    OutCaptions.Add(FString(TEXT("Glinty Water Params")));
++}
++
++uint32 UMaterialExpressionGlintyWaterOutput::GetInputType(int32 InputIndex)
++{
++    switch (InputIndex)
++    {
++        case 0:
++            return MCT_Float2;
++        case 1:
++            return MCT_Float2 | MCT_Float3 | MCT_Float4;
++        case 2:
++            return MCT_Float3 | MCT_Float4;
++        case 3:
++            return MCT_Float4;
++        case 4:
++            return MCT_Float3;
++        case 5:
++            return MCT_Float;
++    }
++    return MCT_Unknown;
++}
++
++FExpressionInput* UMaterialExpressionGlintyWaterOutput::GetInput(int32 InputIndex)
++{
++    switch (InputIndex)
++    {
++        case 0:
++            return &TexCoordInput;
++        case 1:
++            return &Normal1Input;
++        case 2:
++            return &Normal2Input;
++        case 3:
++            return &SigmasRho;
++        case 4:
++            return &LightVector;
++        case 5:
++            return &Density;
++    }
++
++    return nullptr;
++}
++#endif // WITH_EDITOR
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // Vertex to pixel interpolated data handler
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/MaterialHLSLEmitter.cpp b/Engine/Source/Runtime/Engine/Private/Materials/MaterialHLSLEmitter.cpp
+index 53bd4bdb1ba3..97a251ea3072 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/MaterialHLSLEmitter.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/MaterialHLSLEmitter.cpp
+@@ -622,6 +622,13 @@ static void GetMaterialEnvironment(EShaderPlatform InPlatform,
+ 
+ 			bMaterialRequestsDualSourceBlending = true;
+ 		}
++	    if (ShadingModels.HasShadingModel(MSM_GlintyWater))
++	    {
++	        OutEnvironment.SetDefine(TEXT("MATERIAL_SHADINGMODEL_GLINTYWATER"), TEXT("1"));
++	        NumSetMaterials++;
++
++	        bMaterialRequestsDualSourceBlending = true;
++	    }
+ 
+ 		if (ShadingModels.HasShadingModel(MSM_SingleLayerWater) && FDataDrivenShaderPlatformInfo::GetRequiresDisableForwardLocalLights(InPlatform))
+ 		{
+diff --git a/Engine/Source/Runtime/Engine/Private/Materials/MaterialShader.cpp b/Engine/Source/Runtime/Engine/Private/Materials/MaterialShader.cpp
+index 992a632cdea3..3f7141204a4b 100644
+--- a/Engine/Source/Runtime/Engine/Private/Materials/MaterialShader.cpp
++++ b/Engine/Source/Runtime/Engine/Private/Materials/MaterialShader.cpp
+@@ -114,6 +114,7 @@ FString GetShadingModelString(EMaterialShadingModel ShadingModel)
+ 		case MSM_Eye:				ShadingModelName = TEXT("MSM_Eye"); break;
+ 		case MSM_SingleLayerWater:	ShadingModelName = TEXT("MSM_SingleLayerWater"); break;
+ 		case MSM_ThinTranslucent:	ShadingModelName = TEXT("MSM_ThinTranslucent"); break;
++		case MSM_GlintyWater:    	ShadingModelName = TEXT("MSM_GlintyWater"); break;
+ 		default: ShadingModelName = TEXT("Unknown"); break;
+ 	}
+ 	return ShadingModelName;
+@@ -246,7 +247,7 @@ void UpdateMaterialShaderCompilingStats(const FMaterial* Material)
+ 	{
+ 		INC_DWORD_STAT_BY(STAT_ShaderCompiling_NumUnlitMaterialShaders, 1);
+ 	}
+-	else if (ShadingModels.HasAnyShadingModel({ MSM_DefaultLit, MSM_Subsurface, MSM_PreintegratedSkin, MSM_ClearCoat, MSM_Cloth, MSM_SubsurfaceProfile, MSM_TwoSidedFoliage, MSM_SingleLayerWater, MSM_ThinTranslucent }))
++	else if (ShadingModels.HasAnyShadingModel({ MSM_DefaultLit, MSM_Subsurface, MSM_PreintegratedSkin, MSM_ClearCoat, MSM_Cloth, MSM_SubsurfaceProfile, MSM_TwoSidedFoliage, MSM_SingleLayerWater, MSM_ThinTranslucent, MSM_GlintyWater }))
+ 	{
+ 		INC_DWORD_STAT_BY(STAT_ShaderCompiling_NumLitMaterialShaders, 1);
+ 	}
+diff --git a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderGenerationUtil.cpp b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderGenerationUtil.cpp
+index 638583cc9d64..0dc0117a9e50 100644
+--- a/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderGenerationUtil.cpp
++++ b/Engine/Source/Runtime/Engine/Private/ShaderCompiler/ShaderGenerationUtil.cpp
+@@ -141,6 +141,7 @@ void FShaderCompileUtilities::ApplyFetchEnvironment(FShaderMaterialPropertyDefin
+ 	FETCH_COMPILE_BOOL(MATERIAL_SHADINGMODEL_EYE);
+ 	FETCH_COMPILE_BOOL(MATERIAL_SHADINGMODEL_SINGLELAYERWATER);
+ 	FETCH_COMPILE_BOOL(MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT);
++	FETCH_COMPILE_BOOL(MATERIAL_SHADINGMODEL_GLINTYWATER);
+ 
+ 	FETCH_COMPILE_BOOL(SINGLE_LAYER_WATER_SEPARATED_MAIN_LIGHT);
+ 
+@@ -1676,6 +1677,9 @@ static void SetSlotsForShadingModelType(bool Slots[], EMaterialShadingModel Shad
+ 	case MSM_ThinTranslucent:
+ 		// thin translucent doesn't write to the GBuffer
+ 		break;
++	case MSM_GlintyWater:
++	    // glinty water doesn't write to the GBuffer
++	    break;
+ 	}
+ }
+ 
+@@ -1794,6 +1798,11 @@ static void DetermineUsedMaterialSlots(
+ 	{
+ 	}
+ 
++    // doesn't write to GBuffer
++    if (Mat.MATERIAL_SHADINGMODEL_GLINTYWATER)
++    {
++    }
++
+ }
+ 
+ void FShaderCompileUtilities::ApplyDerivedDefines(FShaderCompilerEnvironment& OutEnvironment, FShaderCompilerEnvironment * SharedEnvironment, const EShaderPlatform Platform)
+diff --git a/Engine/Source/Runtime/RenderCore/Public/ShaderMaterial.h b/Engine/Source/Runtime/RenderCore/Public/ShaderMaterial.h
+index f83f6809ef84..f55b66f4f392 100644
+--- a/Engine/Source/Runtime/RenderCore/Public/ShaderMaterial.h
++++ b/Engine/Source/Runtime/RenderCore/Public/ShaderMaterial.h
+@@ -103,6 +103,7 @@ struct FShaderMaterialPropertyDefines
+ 	uint8 MATERIAL_SHADINGMODEL_SINGLELAYERWATER : 1;
+ 	uint8 SINGLE_LAYER_WATER_SEPARATED_MAIN_LIGHT : 1;
+ 	uint8 MATERIAL_SHADINGMODEL_THIN_TRANSLUCENT : 1;
++    uint8 MATERIAL_SHADINGMODEL_GLINTYWATER : 1;
+ 
+ 	uint8 TRANSLUCENCY_LIGHTING_VOLUMETRIC_NONDIRECTIONAL : 1;
+ 	uint8 TRANSLUCENCY_LIGHTING_VOLUMETRIC_DIRECTIONAL : 1;
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp b/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
+index 767aa9a778aa..0a90f614dcaf 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
+@@ -2559,12 +2559,12 @@ FSceneRenderer::FSceneRenderer(const FSceneViewFamily* InViewFamily, FHitProxyCo
+ 			ShouldRenderLumenReflections(*ViewInfo) || 
+ 			ShouldRenderVolumetricCloudWithBlueNoise_GameThread(Scene, *ViewInfo) || 
+ 			UseVirtualShadowMaps(Scene->GetShaderPlatform(), Scene->GetFeatureLevel()) ||
+-			Strata::IsGlintEnabled())
++			Strata::IsGlintEnabled() || true)
+ 		{
+ 			GEngine->LoadBlueNoiseTexture();
+ 		}
+ 
+-		if (Strata::IsGlintEnabled())
++		if (true)//Strata::IsGlintEnabled())
+ 		{
+ 			GEngine->LoadGlintTextures();
+ 		}
+-- 
+2.45.1.windows.1
+

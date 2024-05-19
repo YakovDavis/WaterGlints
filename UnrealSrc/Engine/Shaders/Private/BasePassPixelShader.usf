@@ -1,0 +1,30 @@
+
+//...
+
+	//=============================================================================
+	//====YAKOV: Start of the contribution part 1==================================
+	//=============================================================================
+
+#if MATERIAL_SHADINGMODEL_GLINTYWATER && !STRATA_ENABLED
+	{
+		AccumulateGlintyWaterModel(
+								DualBlendSurfaceLuminancePostCoverage,
+								DualBlendSurfaceTransmittancePreCoverage,
+								DualBlendSurfaceCoverage,
+								MaterialParameters,
+								GBuffer,
+								DiffuseColor,
+								ColorSeparateSpecular,
+								Emissive,
+								Opacity);
+
+		Color = 0;
+		Opacity = 1.0f;
+	}
+#endif // MATERIAL_SHADINGMODEL_GLINTYWATER
+
+	//=============================================================================
+	//====YAKOV: End of the contribution part 1====================================
+	//=============================================================================
+
+//...
