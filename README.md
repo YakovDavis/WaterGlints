@@ -1,33 +1,34 @@
-# Glint rendering with normal map filtering for water surface rendering
-Supplementary material for Master's Thesis on water surface rendering using glints
+# 	Исследование и разработка алгоритма графического отображения бликов на поверхности воды в режиме реального времени
+Дополнительные материалы к магистерской ВКП.
 
-Based on the method of Xavier Chermain et al (http://igg.unistra.fr/People/chermain/glint_anti_aliasing/).
+Основано на методе Xavier Chermain et al (http://igg.unistra.fr/People/chermain/glint_anti_aliasing/).
 
-## Overview
-We proposed a modified V-cavity masking and shadowing function that is compatible with non-centered Beckmann normal distribution.
-Using this function we modified the algorithm to use LEADR Mapping (https://inria.hal.science/hal-00858220/en) instead of LEAN Mapping (https://redirect.cs.umbc.edu/~olano/papers/lean/).
-This allowed us to calculate accurate projection weights in our BRDF and improve the realism of the resulting picture.
+## Обзор
+Предложена модифицированная функцию экранирования и затенения V-бороздок, совместимую с нецентрированным распределением Бекманна.
+Используя эту функцию, алгоритм был модифицирован, для использования с LEADR Mapping  (https://inria.hal.science/hal-00858220/en) вместо LEAN Mapping (https://redirect.cs.umbc.edu/~olano/papers/lean/).
+Это позволяет рассчитать точные веса проекций в BRDF и повысить реалистичность отрисовки.
 
-Two implementations are availaible - as a modification to the original authors' prototype and as a patch for Unreal Engine 5.3. Unreal Engine 5.3 already has an implementation for Chermain's algorithm in their Substrate Materials experimental model, which offers a good point of comparison.
+Доступны две реализации — модификация оригинального прототипа Шермейна и патч для Unreal Engine 5.3. В Unreal Engine 5.3 уже есть реализация алгоритма Шермейна в их экспериментальной модели Substrate Materials, что позволяет сравнить результаты.
 
-## Example
-![photo1715519452](https://github.com/YakovDavis/WaterGlints/assets/11318110/4c6ebe40-e263-4a5f-ad43-0baeb9fd5f8b)
-Simulated ocean surface rendering using Unreal Engine 5.3 with our modification
+## Пример
+![Screenshot 2024-05-23 030755](https://github.com/YakovDavis/WaterGlints/assets/11318110/a7b86a57-98f0-4555-b814-94eff3cd9366)
+Отрисовка поверхности океана с помощью алгоритма в Unreal Engine 5.3.
 
-## Installation
-### A. Chermain's prototype
-1. Download and extract the "Code" archive from the website http://igg.unistra.fr/People/chermain/glint_anti_aliasing/
-2. Navigate to */stephen_supplemental_material/code* and paste the contents of the ChermainMod folder from this repository
-3. Compile the project as usual
+## Установка
+### A. Прототип Шермейна
+1. Скачайте и распакуйте архив "Code" с сайта http://igg.unistra.fr/People/chermain/glint_anti_aliasing/
+2. Перейдите в */stephen_supplemental_material/code* и вставьте с заменой содержимое папки ChermainMod из этого репозитория
+3. Скомпилируйте проект
 
 ### B. Unreal Engine 5.3
-1. Acquire access to Unreal Engine repository
-2. Clone the 5.3.2-release tag
-3. Apply the git patch from the UnrealPatch folder from this repository (copy the patch to the Unreal Engine directory root and run ```git apply 0001-Custom-Glints-for-Unreal-fix-for-stats-command.patch```) 
-4. Setup and compile the Engine as usual
-5. ATTENTION: the code in the UnrealSrc folder is not the complete code needed for the project and all the parts from the actual Unreal Source are removed. Use the patch to actually install the modification.
+1. Получите доступ к репозиторию Unreal Engine
+2. Склонируйте тэг 5.3.2-release
+3. Примените патч из папки UnrealPatch репозитория (скопируйте патч в корень папки Unreal Engine и запустите ```git apply 0001-Custom-Glints-for-Unreal-fix-for-stats-command.patch```) 
+4. Установите и скомпилируйте движок
+5. ВНИМАНИЕ: код в папке UnrealSrc не является полным кодом, необходимым для проекта, и все части из исходного кода Unreal удалены по лицензионным соображениям. Используйте патч, чтобы установить модификацию.
 
-## Unreal usage instructions
-The patch adds a new Shading model called "Glinty Water", you can use it for a translucent material (set to forward shading surface) to make a glinty material. Substrate Materials must be disabled for this to work. To set up the parameters for our model, use the Material Editor node called "Glinty Water Params". You can find an example of how to set everyithing up in either of the two included demo projects in the UnrealProjects folder.
+## Инструкции по использованию в Unreal
+Патч добавляет новую модель отрисовки под названием «Glinty Water». Ее можно использовать для полупрозрачного материала (с включенным forward shading surface в настройках материала), чтобы создать блестящий материал. Substrate Material должны быть отключены. Чтобы передать в модель необходимые параметры, используйте ноду под названием «Glinty Water Params» в редакторе материалов. Вы можете найти примеры того, как настроить материал, в любом из двух демонстрационных проектов в папке UnrealProjects.
 
-The WaterSim demo project is based on this repo for Niagara-based ocean simulation (https://github.com/Deathrey/NiagaraOceanTutorial)
+Демо-проект WaterSim основан на этом репозитории для моделирования океана с помощью системы частиц Niagara
+(https://github.com/Deathrey/NiagaraOceanTutorial)
