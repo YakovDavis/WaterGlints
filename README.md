@@ -32,3 +32,6 @@
 
 Демо-проект WaterSim основан на этом репозитории для моделирования океана с помощью системы частиц Niagara
 (https://github.com/Deathrey/NiagaraOceanTutorial)
+
+## Текст работы
+Текст работы можно найти в папке /Docs/WaterGlints.pdf в данном репозитории
